@@ -131,9 +131,25 @@ UPDATE_BRANCH = os.environ.get("ONEX_UPDATE_BRANCH", "main").strip() or "main"
 UPDATE_VERSION_URL = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}/version.json"
 UPDATE_GITHUB_API = f"https://api.github.com/repos/{UPDATE_REPO}"
 RAILWAY_API_URL = os.environ.get("RAILWAY_API_URL", "https://backboard.railway.com/graphql/v2").strip()
-RAILWAY_API_TOKEN = os.environ.get("RAILWAY_API_TOKEN", "").strip()
-RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID", "").strip()
-RAILWAY_ENVIRONMENT_ID = os.environ.get("RAILWAY_ENVIRONMENT_ID", "").strip()
+# Railway supplies SERVICE_ID / ENVIRONMENT_ID automatically to a running
+# service. Only the deployment API token normally needs to be configured by
+# the owner. Keep explicit ONEX_* aliases for non-Railway/local deployments.
+# Railway authentication: prefer the project-scoped RAILWAY_TOKEN when present.
+# RAILWAY_API_TOKEN remains supported for account/workspace tokens.
+RAILWAY_PROJECT_TOKEN = os.environ.get("RAILWAY_TOKEN", "").strip()
+RAILWAY_API_TOKEN = (
+    os.environ.get("RAILWAY_API_TOKEN", "").strip()
+    or os.environ.get("ONEX_RAILWAY_API_TOKEN", "").strip()
+)
+RAILWAY_AUTH_TOKEN = RAILWAY_PROJECT_TOKEN or RAILWAY_API_TOKEN
+RAILWAY_SERVICE_ID = (
+    os.environ.get("RAILWAY_SERVICE_ID", "").strip()
+    or os.environ.get("ONEX_RAILWAY_SERVICE_ID", "").strip()
+)
+RAILWAY_ENVIRONMENT_ID = (
+    os.environ.get("RAILWAY_ENVIRONMENT_ID", "").strip()
+    or os.environ.get("ONEX_RAILWAY_ENVIRONMENT_ID", "").strip()
+)
 ONEX_CURRENT_COMMIT_SHA = os.environ.get("RAILWAY_GIT_COMMIT_SHA", os.environ.get("ONEX_COMMIT_SHA", "")).strip()
 
 
@@ -7434,7 +7450,12 @@ async def api_update_check(token=Depends(require_auth)):
             "changelog": remote.get("changelog", []),
             "published_at": remote.get("published_at", ""),
             "release_url": remote.get("release_url", ""),
-            "configured": bool(RAILWAY_API_TOKEN and RAILWAY_SERVICE_ID and RAILWAY_ENVIRONMENT_ID),
+            "configured": bool(RAILWAY_AUTH_TOKEN and RAILWAY_SERVICE_ID and RAILWAY_ENVIRONMENT_ID),
+            "configuration": {
+                "token": bool(RAILWAY_AUTH_TOKEN),
+                "service_id": bool(RAILWAY_SERVICE_ID),
+                "environment_id": bool(RAILWAY_ENVIRONMENT_ID),
+            },
         }
     except Exception as exc:
         logger.warning("Update check failed: %s", exc)
@@ -7451,11 +7472,23 @@ async def api_update_check(token=Depends(require_auth)):
 @app.post("/api/update/deploy")
 async def api_update_deploy(token=Depends(require_auth)):
     meta = get_session_meta(token)
-    if meta.get("role") != "owner":
-        raise HTTPException(403, detail="فقط مالک پنل می‌تواند پنل را بروزرسانی کند")
-
-    if not (RAILWAY_API_TOKEN and RAILWAY_SERVICE_ID and RAILWAY_ENVIRONMENT_ID):
-        raise HTTPException(503, detail="تنظیمات اتصال امن Railway برای بروزرسانی کامل نشده است")
+    # Any authenticated panel user may request the update.
+    # The owner configures the Railway API token once in the service Variables;
+    # Railway supplies SERVICE_ID and ENVIRONMENT_ID automatically.
+    missing = []
+    if not RAILWAY_AUTH_TOKEN:
+        missing.append("RAILWAY_API_TOKEN")
+    if not RAILWAY_SERVICE_ID:
+        missing.append("RAILWAY_SERVICE_ID")
+    if not RAILWAY_ENVIRONMENT_ID:
+        missing.append("RAILWAY_ENVIRONMENT_ID")
+    if missing:
+        # SERVICE_ID and ENVIRONMENT_ID are normally supplied by Railway itself;
+        # if either is missing, this is most likely a non-Railway/local runtime.
+        detail = "تنظیمات بروزرسانی Railway کامل نیست. متغیرهای مفقود: " + ", ".join(missing)
+        if missing == ["RAILWAY_API_TOKEN"]:
+            detail += " — فقط توکن API Railway با دسترسی Deployments را در Variables تنظیم کنید."
+        raise HTTPException(503, detail=detail)
 
     try:
         remote = await fetch_update_info()
@@ -7475,6 +7508,8 @@ async def api_update_deploy(token=Depends(require_auth)):
         commit_sha = remote.get("commit_sha")
         if not commit_sha:
             raise RuntimeError("GitHub commit SHA not found")
+        # If Railway did not expose the current Git SHA, the owner may still
+        # use the button to deploy the latest connected GitHub commit.
 
         mutation = """
         mutation ServiceInstanceDeployV2($serviceId: String!, $environmentId: String!, $commitSha: String) {
@@ -7494,7 +7529,9 @@ async def api_update_deploy(token=Depends(require_auth)):
                 RAILWAY_API_URL,
                 json=payload,
                 headers={
-                    "Authorization": f"Bearer {RAILWAY_API_TOKEN}",
+                    **({"Project-Access-Token": RAILWAY_PROJECT_TOKEN}
+                       if RAILWAY_PROJECT_TOKEN
+                       else {"Authorization": f"Bearer {RAILWAY_API_TOKEN}"}),
                     "Content-Type": "application/json",
                     "User-Agent": "ONEX-Panel-Updater",
                 },
@@ -7503,7 +7540,12 @@ async def api_update_deploy(token=Depends(require_auth)):
             data = response.json()
 
         if data.get("errors"):
-            raise RuntimeError(str(data["errors"]))
+            errors = data.get("errors") or []
+            messages = []
+            for item in errors:
+                if isinstance(item, dict) and item.get("message"):
+                    messages.append(str(item["message"]))
+            raise RuntimeError("; ".join(messages) or "Railway API returned an error")
         deployment_id = ((data.get("data") or {}).get("serviceInstanceDeployV2") or "").strip()
         if not deployment_id:
             raise RuntimeError("Railway did not return a deployment id")
