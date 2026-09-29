@@ -1,4 +1,66 @@
 # ============================================================
+# ONEX SELF-UPDATE BOOTLOADER (1.3.9)
+# Zero-config in-panel updates: the panel downloads the newest public release
+# into the data dir and re-executes itself from there. No Railway/GitHub
+# tokens are needed. A bundled build that is newer (manual redeploy) always
+# wins, and a broken update is abandoned after 3 failed boots.
+# ============================================================
+import os as _ob_os, sys as _ob_sys, json as _ob_json
+from pathlib import Path as _ob_Path
+
+
+def _ob_ver(v):
+    out = []
+    for part in str(v or "0").strip().lstrip("vV").split(".")[:8]:
+        d = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(d or "0"))
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out)
+
+
+def _onex_bootloader():
+    if _ob_os.environ.get("ONEX_SELF_UPDATED_BOOT") == "1":
+        return
+    here = _ob_Path(__file__).resolve().parent
+    data = _ob_Path(_ob_os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or _ob_os.environ.get("DATA_DIR") or "./data").resolve()
+    # Pin the data dir so the updated copy keeps using the same state files.
+    if not _ob_os.environ.get("RAILWAY_VOLUME_MOUNT_PATH"):
+        _ob_os.environ["DATA_DIR"] = str(data)
+    _ob_os.environ.setdefault("ONEX_BUNDLED_DIR", str(here))
+    root = data / "onex_update"
+    cur = root / "current"
+    try:
+        if not (cur / "main.py").exists():
+            return
+        upd_v = _ob_json.loads((cur / "version.json").read_text(encoding="utf-8")).get("version")
+        try:
+            own_v = _ob_json.loads((here / "version.json").read_text(encoding="utf-8")).get("version")
+        except Exception:
+            own_v = "0"
+        if _ob_ver(upd_v) <= _ob_ver(own_v):
+            return
+        attempts_file = root / "boot_attempts"
+        attempts = int((attempts_file.read_text() or "0").strip()) if attempts_file.exists() else 0
+        if attempts >= 3:
+            print("[ONEX] downloaded update failed to boot 3 times; using bundled build", flush=True)
+            return
+        attempts_file.write_text(str(attempts + 1))
+        sha_file = cur / ".onex_commit"
+        if sha_file.exists():
+            _ob_os.environ["RAILWAY_GIT_COMMIT_SHA"] = sha_file.read_text().strip()
+        _ob_os.environ["ONEX_SELF_UPDATED_BOOT"] = "1"
+        print(f"[ONEX] booting downloaded update v{upd_v}", flush=True)
+        _ob_os.chdir(str(cur))
+        _ob_os.execv(_ob_sys.executable, [_ob_sys.executable, str(cur / "main.py")])
+    except Exception as exc:  # never block the bundled panel from starting
+        print(f"[ONEX] update bootloader skipped: {exc}", flush=True)
+
+
+if __name__ == "__main__":
+    _onex_bootloader()
+
+# ============================================================
 # Railway Ready
 # Designed by @Mehtif
 # ============================================================
@@ -39,7 +101,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 
 APP_NAME = "ONEX"
-APP_VERSION = "1.3.8"
+APP_VERSION = "1.3.9"
 
 SUPPORT_USERNAME = "@V2rayTun0"
 SUPPORT_URL = "https://t.me/V2rayTun0"
@@ -135,6 +197,14 @@ RAILWAY_API_TOKEN = os.environ.get("RAILWAY_API_TOKEN", "").strip()
 RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID", "").strip()
 RAILWAY_ENVIRONMENT_ID = os.environ.get("RAILWAY_ENVIRONMENT_ID", "").strip()
 ONEX_CURRENT_COMMIT_SHA = os.environ.get("RAILWAY_GIT_COMMIT_SHA", os.environ.get("ONEX_COMMIT_SHA", "")).strip()
+# Fork auto-sync: Railway builds from the user's own repo (often a fork).
+# Railway exposes the connected repo; ONEX_DEPLOY_REPO can override it.
+_rw_owner = os.environ.get("RAILWAY_GIT_REPO_OWNER", "").strip()
+_rw_name = os.environ.get("RAILWAY_GIT_REPO_NAME", "").strip()
+DEPLOY_REPO = (os.environ.get("ONEX_DEPLOY_REPO", "").strip()
+               or (f"{_rw_owner}/{_rw_name}" if _rw_owner and _rw_name else ""))
+DEPLOY_BRANCH = (os.environ.get("ONEX_DEPLOY_BRANCH", "").strip()
+                 or os.environ.get("RAILWAY_GIT_BRANCH", "").strip() or UPDATE_BRANCH)
 
 
 # ============================================================
@@ -7470,48 +7540,275 @@ def _is_newer_version(remote, local):
     return _version_tuple(remote) > _version_tuple(local)
 
 
-async def fetch_update_info():
-    """Read public release metadata and the latest GitHub commit."""
+_UPDATE_CACHE = {"at": 0.0, "data": None}
+UPDATE_CACHE_TTL = 300  # seconds; the panel polls often, GitHub rate-limits hard
+GITHUB_TOKEN = (os.environ.get("ONEX_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
+
+
+async def fetch_update_info(force: bool = False):
+    """Read public release metadata and the latest GitHub commit (cached).
+
+    Unauthenticated GitHub API calls are limited to 60/hour per IP and
+    Railway egress IPs are shared, so polling every 45s used to exhaust the
+    quota and every check/deploy then failed.  Results are cached and the
+    commit lookup is optional: version.json alone is enough to update.
+    """
+    now = time.time()
+    cached = _UPDATE_CACHE.get("data")
+    if cached and not force and now - _UPDATE_CACHE.get("at", 0) < UPDATE_CACHE_TTL:
+        return dict(cached)
+    headers = {"User-Agent": "ONEX-Panel-Updater", "Cache-Control": "no-cache"}
+    api_headers = {**headers, "Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        api_headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    timeout = httpx.Timeout(10.0, connect=5.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            version_resp = await client.get(UPDATE_VERSION_URL, headers=headers, params={"t": int(now)})
+            version_resp.raise_for_status()
+            meta = version_resp.json()
+            if not isinstance(meta, dict):
+                raise ValueError("version.json must contain a JSON object")
+            sha = ""
+            try:
+                commit_resp = await client.get(
+                    f"{UPDATE_GITHUB_API}/commits/{quote(UPDATE_BRANCH, safe='')}",
+                    headers=api_headers,
+                )
+                if commit_resp.status_code == 200:
+                    sha = str((commit_resp.json() or {}).get("sha") or "").strip()
+                else:
+                    logger.warning("GitHub commit lookup returned %s", commit_resp.status_code)
+            except Exception as exc:
+                logger.warning("GitHub commit lookup failed: %s", exc)
+            if not sha and cached:
+                sha = cached.get("commit_sha") or ""
+    except Exception:
+        if cached:
+            return dict(cached)
+        raise
+    data = {
+        "version": str(meta.get("version") or "").strip(),
+        "title": str(meta.get("title") or "").strip(),
+        "message": str(meta.get("message") or "").strip(),
+        "changelog": meta.get("changelog") if isinstance(meta.get("changelog"), list) else [],
+        "published_at": str(meta.get("published_at") or "").strip(),
+        "commit_sha": sha,
+        "repo": UPDATE_REPO,
+        "branch": UPDATE_BRANCH,
+        "release_url": str(meta.get("release_url") or f"https://github.com/{UPDATE_REPO}/commits/{UPDATE_BRANCH}").strip(),
+    }
+    _UPDATE_CACHE["at"] = now
+    _UPDATE_CACHE["data"] = data
+    return dict(data)
+
+
+async def _railway_graphql(query: str, variables: dict) -> dict:
+    """Call Railway GraphQL, supporting account/workspace AND project tokens.
+
+    Account/workspace tokens use `Authorization: Bearer`, project tokens use
+    `Project-Access-Token`.  Using the wrong header returns "Not Authorized",
+    which is the classic cause of "update failed" in the panel.
+    """
+    header_sets = [
+        {"Authorization": f"Bearer {RAILWAY_API_TOKEN}"},
+        {"Project-Access-Token": RAILWAY_API_TOKEN},
+    ]
+    last_error = "unknown error"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=8.0)) as client:
+        for extra in header_sets:
+            try:
+                response = await client.post(
+                    RAILWAY_API_URL,
+                    json={"query": query, "variables": variables},
+                    headers={"Content-Type": "application/json", "User-Agent": "ONEX-Panel-Updater", **extra},
+                )
+            except Exception as exc:
+                last_error = f"network: {exc}"
+                continue
+            try:
+                data = response.json()
+            except Exception:
+                data = {}
+            errors = data.get("errors") if isinstance(data, dict) else None
+            if response.status_code < 400 and not errors:
+                return data.get("data") or {}
+            msg = "; ".join(str(e.get("message") or e) for e in (errors or []) if e) or f"HTTP {response.status_code}"
+            last_error = msg
+            if "not authorized" not in msg.lower() and response.status_code not in (401, 403):
+                break  # auth was fine, the request itself failed
+    raise RuntimeError(last_error)
+
+
+def _is_fork_deploy() -> bool:
+    return bool(DEPLOY_REPO) and DEPLOY_REPO.lower() != UPDATE_REPO.lower()
+
+
+async def sync_fork_with_upstream() -> dict:
+    """Bring the user's fork up to date with the ONEX repo before deploying.
+
+    Uses GitHub's merge-upstream API (same as the "Sync fork" button).
+    Returns {"synced": bool, "sha": <fork head sha>, "note": str}.
+    """
+    if not _is_fork_deploy():
+        return {"synced": False, "sha": "", "note": "not a fork"}
+    if not GITHUB_TOKEN:
+        raise RuntimeError(
+            f"پنل از فورک «{DEPLOY_REPO}» دیپلوی شده؛ برای همگام‌سازی خودکار متغیر ONEX_GITHUB_TOKEN "
+            "(توکن گیت‌هاب با دسترسی Contents: Read and write روی فورک) را در Railway اضافه کنید "
+            "یا یک‌بار دکمه Sync fork را در گیت‌هاب بزنید."
+        )
     headers = {
         "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
         "User-Agent": "ONEX-Panel-Updater",
+        "X-GitHub-Api-Version": "2022-11-28",
     }
-    timeout = httpx.Timeout(10.0, connect=5.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        version_resp = await client.get(UPDATE_VERSION_URL, headers=headers)
-        version_resp.raise_for_status()
-        meta = version_resp.json()
-        if not isinstance(meta, dict):
-            raise ValueError("version.json must contain a JSON object")
+    api = f"https://api.github.com/repos/{DEPLOY_REPO}"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=8.0)) as client:
+        r = await client.post(f"{api}/merge-upstream", headers=headers, json={"branch": DEPLOY_BRANCH})
+        if r.status_code == 409:
+            raise RuntimeError("همگام‌سازی فورک به دلیل تداخل (conflict) انجام نشد؛ فورک را دستی با ریپوی اصلی یکی کنید.")
+        if r.status_code in (401, 403):
+            raise RuntimeError("توکن گیت‌هاب اجازه نوشتن روی فورک را ندارد (Contents: Read and write لازم است).")
+        if r.status_code == 404:
+            raise RuntimeError(f"ریپو یا برنچ «{DEPLOY_REPO}@{DEPLOY_BRANCH}» پیدا نشد یا توکن به آن دسترسی ندارد.")
+        if r.status_code >= 400:
+            raise RuntimeError(f"همگام‌سازی فورک ناموفق بود: HTTP {r.status_code} {r.text[:200]}")
+        info = r.json() if r.content else {}
+        head = await client.get(f"{api}/commits/{quote(DEPLOY_BRANCH, safe='')}", headers=headers)
+        sha = str((head.json() or {}).get("sha") or "").strip() if head.status_code == 200 else ""
+    merge_type = str(info.get("merge_type") or "")
+    logger.info("Fork sync %s@%s: %s (%s)", DEPLOY_REPO, DEPLOY_BRANCH, merge_type or "ok", sha[:8])
+    return {"synced": merge_type != "none", "sha": sha, "note": info.get("message") or merge_type}
 
-        commit_resp = await client.get(
-            f"{UPDATE_GITHUB_API}/commits/{quote(UPDATE_BRANCH, safe='')}",
-            headers=headers,
-        )
-        commit_resp.raise_for_status()
-        commit_data = commit_resp.json()
-        sha = str(commit_data.get("sha") or "").strip()
-        return {
-            "version": str(meta.get("version") or "").strip(),
-            "title": str(meta.get("title") or "").strip(),
-            "message": str(meta.get("message") or "").strip(),
-            "changelog": meta.get("changelog") if isinstance(meta.get("changelog"), list) else [],
-            "published_at": str(meta.get("published_at") or "").strip(),
-            "commit_sha": sha,
-            "repo": UPDATE_REPO,
-            "branch": UPDATE_BRANCH,
-            "release_url": str(meta.get("release_url") or f"https://github.com/{UPDATE_REPO}/commits/{UPDATE_BRANCH}").strip(),
-        }
+
+SELF_UPDATE_ROOT = DATA_DIR / "onex_update"
+_SELF_UPDATE_LOCK = asyncio.Lock()
+
+
+def _self_update_install(zip_path: Path, sha: str) -> Path:
+    """Extract, validate and atomically activate a downloaded release (sync)."""
+    import py_compile
+    import shutil
+    import subprocess
+    import sys
+    import zipfile
+
+    staging = SELF_UPDATE_ROOT / "staging"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        for member in zf.namelist():
+            target = (staging / member).resolve()
+            if not str(target).startswith(str(staging.resolve())):
+                raise RuntimeError("unsafe path in update archive")
+        zf.extractall(staging)
+    candidates = [p.parent for p in staging.rglob("main.py") if (p.parent / "version.json").exists()]
+    if not candidates:
+        raise RuntimeError("main.py / version.json در فایل بروزرسانی پیدا نشد")
+    src = min(candidates, key=lambda p: len(p.parts))
+    py_compile.compile(str(src / "main.py"), doraise=True)
+    new_v = json.loads((src / "version.json").read_text(encoding="utf-8")).get("version")
+    if not new_v:
+        raise RuntimeError("version.json نسخه ندارد")
+
+    # Install new dependencies only when requirements.txt actually changed.
+    running_dir = BASE_DIR
+    try:
+        old_req = (running_dir / "requirements.txt").read_text(encoding="utf-8")
+    except Exception:
+        old_req = ""
+    new_req_file = src / "requirements.txt"
+    if new_req_file.exists() and new_req_file.read_text(encoding="utf-8") != old_req:
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-q", "-r", str(new_req_file)],
+                check=False, timeout=240,
+            )
+        except Exception as exc:
+            logger.warning("pip install for update skipped: %s", exc)
+
+    (src / ".onex_commit").write_text(sha or "", encoding="utf-8")
+    cur = SELF_UPDATE_ROOT / "current"
+    prev = SELF_UPDATE_ROOT / "previous"
+    shutil.rmtree(prev, ignore_errors=True)
+    if cur.exists():
+        cur.rename(prev)
+    shutil.move(str(src), str(cur))
+    shutil.rmtree(staging, ignore_errors=True)
+    (SELF_UPDATE_ROOT / "boot_attempts").write_text("1")
+    return cur
+
+
+async def _self_update_restart(cur: Path, sha: str):
+    import sys
+    await asyncio.sleep(1.5)  # let the HTTP response reach the browser
+    try:
+        await save_state()
+    except Exception:
+        pass
+    os.environ["ONEX_SELF_UPDATED_BOOT"] = "1"
+    if sha:
+        os.environ["RAILWAY_GIT_COMMIT_SHA"] = sha
+    logger.info("Restarting into downloaded update at %s", cur)
+    os.chdir(str(cur))
+    os.execv(sys.executable, [sys.executable, str(cur / "main.py")])
+
+
+async def self_update_from_github(remote: dict) -> dict:
+    """Zero-config update: download the public release and restart into it."""
+    if _SELF_UPDATE_LOCK.locked():
+        raise RuntimeError("یک بروزرسانی در حال انجام است")
+    async with _SELF_UPDATE_LOCK:
+        sha = str(remote.get("commit_sha") or "").strip()
+        ref = sha or UPDATE_BRANCH
+        url = f"https://codeload.github.com/{UPDATE_REPO}/zip/{quote(ref, safe='')}"
+        SELF_UPDATE_ROOT.mkdir(parents=True, exist_ok=True)
+        zip_path = SELF_UPDATE_ROOT / "download.zip"
+        size = 0
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0), follow_redirects=True) as client:
+            async with client.stream("GET", url, headers={"User-Agent": "ONEX-Panel-Updater"}) as resp:
+                if resp.status_code != 200:
+                    raise RuntimeError(f"دانلود نسخه جدید از گیت‌هاب ناموفق بود (HTTP {resp.status_code})")
+                with open(zip_path, "wb") as fh:
+                    async for chunk in resp.aiter_bytes(256 * 1024):
+                        size += len(chunk)
+                        if size > 300 * 1024 * 1024:
+                            raise RuntimeError("فایل بروزرسانی بیش از حد بزرگ است")
+                        fh.write(chunk)
+        cur = await asyncio.to_thread(_self_update_install, zip_path, sha)
+        try:
+            zip_path.unlink()
+        except Exception:
+            pass
+        asyncio.get_running_loop().create_task(_self_update_restart(cur, sha))
+        return {"path": str(cur)}
+
+
+@app.on_event("startup")
+async def _self_update_mark_healthy():
+    if os.environ.get("ONEX_SELF_UPDATED_BOOT") != "1":
+        return
+
+    async def _mark():
+        await asyncio.sleep(30)
+        try:
+            (SELF_UPDATE_ROOT / "boot_attempts").write_text("0")
+        except Exception:
+            pass
+    asyncio.get_running_loop().create_task(_mark())
 
 
 @app.get("/api/update/check")
-async def api_update_check(token=Depends(require_auth)):
+async def api_update_check(force: int = 0, token=Depends(require_auth)):
     try:
-        remote = await fetch_update_info()
+        remote = await fetch_update_info(force=bool(force))
         remote_version = remote.get("version") or APP_VERSION
         version_newer = _is_newer_version(remote_version, APP_VERSION)
         commit_changed = bool(
-            remote.get("commit_sha")
+            not _is_fork_deploy()
+            and remote.get("commit_sha")
             and ONEX_CURRENT_COMMIT_SHA
             and remote.get("commit_sha") != ONEX_CURRENT_COMMIT_SHA
         )
@@ -7533,6 +7830,10 @@ async def api_update_check(token=Depends(require_auth)):
             "published_at": remote.get("published_at", ""),
             "release_url": remote.get("release_url", ""),
             "configured": bool(RAILWAY_API_TOKEN and RAILWAY_SERVICE_ID and RAILWAY_ENVIRONMENT_ID),
+            "deploy_repo": DEPLOY_REPO or UPDATE_REPO,
+            "fork_deploy": _is_fork_deploy(),
+            "fork_sync_ready": (not _is_fork_deploy()) or bool(GITHUB_TOKEN),
+            "missing_config": [k for k, v in (("RAILWAY_API_TOKEN", RAILWAY_API_TOKEN), ("RAILWAY_SERVICE_ID", RAILWAY_SERVICE_ID), ("RAILWAY_ENVIRONMENT_ID", RAILWAY_ENVIRONMENT_ID)) if not v],
         }
     except Exception as exc:
         logger.warning("Update check failed: %s", exc)
@@ -7552,59 +7853,80 @@ async def api_update_deploy(token=Depends(require_auth)):
     if meta.get("role") != "owner":
         raise HTTPException(403, detail="فقط مالک پنل می‌تواند پنل را بروزرسانی کند")
 
-    if not (RAILWAY_API_TOKEN and RAILWAY_SERVICE_ID and RAILWAY_ENVIRONMENT_ID):
-        raise HTTPException(503, detail="تنظیمات اتصال امن Railway برای بروزرسانی کامل نشده است")
+    railway_ready = bool(RAILWAY_API_TOKEN and RAILWAY_SERVICE_ID and RAILWAY_ENVIRONMENT_ID)
+    # Railway redeploys need a token (and a GitHub token for forks). Without
+    # them we fall back to the zero-config self-update, so users never have
+    # to set anything.
+    use_railway = railway_ready and (not _is_fork_deploy() or bool(GITHUB_TOKEN))
 
     try:
-        remote = await fetch_update_info()
+        try:
+            remote = await fetch_update_info(force=True)
+        except Exception as exc:
+            logger.warning("Update metadata unavailable, deploying latest commit anyway: %s", exc)
+            remote = {"version": "", "commit_sha": ""}
         remote_version = remote.get("version") or APP_VERSION
         version_newer = _is_newer_version(remote_version, APP_VERSION)
-        commit_changed = bool(remote.get("commit_sha") and ONEX_CURRENT_COMMIT_SHA and remote.get("commit_sha") != ONEX_CURRENT_COMMIT_SHA)
-        if not (version_newer or commit_changed):
+        commit_sha = remote.get("commit_sha") or ""
+        commit_changed = bool(not _is_fork_deploy() and commit_sha and ONEX_CURRENT_COMMIT_SHA and commit_sha != ONEX_CURRENT_COMMIT_SHA)
+        if remote.get("version") and not (version_newer or commit_changed):
             return {
                 "ok": True,
                 "update_available": False,
                 "message": "پنل شما آخرین نسخه را دارد",
                 "current_version": APP_VERSION,
                 "latest_version": remote_version,
-                "latest_commit": remote.get("commit_sha"),
+                "latest_commit": commit_sha,
             }
 
-        commit_sha = remote.get("commit_sha")
-        if not commit_sha:
-            raise RuntimeError("GitHub commit SHA not found")
+        if not use_railway:
+            await self_update_from_github(remote)
+            log_activity("system", f"بروزرسانی خودکار پنل به نسخه {remote_version} شروع شد", "ok")
+            return {
+                "ok": True,
+                "update_started": True,
+                "method": "self",
+                "current_version": APP_VERSION,
+                "latest_version": remote_version,
+                "message": "نسخه جدید دانلود شد؛ پنل چند ثانیه دیگر با نسخه جدید دوباره بالا می‌آید.",
+            }
 
-        mutation = """
-        mutation ServiceInstanceDeployV2($serviceId: String!, $environmentId: String!, $commitSha: String) {
-          serviceInstanceDeployV2(serviceId: $serviceId, environmentId: $environmentId, commitSha: $commitSha)
-        }
-        """
-        payload = {
-            "query": mutation,
-            "variables": {
-                "serviceId": RAILWAY_SERVICE_ID,
-                "environmentId": RAILWAY_ENVIRONMENT_ID,
-                "commitSha": commit_sha,
-            },
-        }
-        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=8.0)) as client:
-            response = await client.post(
-                RAILWAY_API_URL,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {RAILWAY_API_TOKEN}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "ONEX-Panel-Updater",
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
+        # Forked deployments: Railway only sees the fork, so sync it first
+        # and deploy the fork's new head commit instead of the upstream SHA.
+        fork_note = ""
+        if _is_fork_deploy():
+            fork = await sync_fork_with_upstream()
+            commit_sha = fork.get("sha") or ""
+            fork_note = f" (فورک {DEPLOY_REPO} همگام شد)"
 
-        if data.get("errors"):
-            raise RuntimeError(str(data["errors"]))
-        deployment_id = ((data.get("data") or {}).get("serviceInstanceDeployV2") or "").strip()
+        deployment_id = ""
+        first_error = None
+        if commit_sha:
+            try:
+                data = await _railway_graphql(
+                    """mutation Deploy($serviceId: String!, $environmentId: String!, $commitSha: String) {
+                      serviceInstanceDeployV2(serviceId: $serviceId, environmentId: $environmentId, commitSha: $commitSha)
+                    }""",
+                    {"serviceId": RAILWAY_SERVICE_ID, "environmentId": RAILWAY_ENVIRONMENT_ID, "commitSha": commit_sha},
+                )
+                deployment_id = str(data.get("serviceInstanceDeployV2") or "").strip()
+            except Exception as exc:
+                first_error = exc
+                logger.warning("serviceInstanceDeployV2 failed, trying latestCommit deploy: %s", exc)
         if not deployment_id:
-            raise RuntimeError("Railway did not return a deployment id")
+            # Fallback: deploy the latest commit of the connected branch.
+            try:
+                data = await _railway_graphql(
+                    """mutation DeployLatest($serviceId: String!, $environmentId: String!) {
+                      serviceInstanceDeploy(serviceId: $serviceId, environmentId: $environmentId, latestCommit: true)
+                    }""",
+                    {"serviceId": RAILWAY_SERVICE_ID, "environmentId": RAILWAY_ENVIRONMENT_ID},
+                )
+                if not data.get("serviceInstanceDeploy"):
+                    raise RuntimeError("Railway did not accept the deployment")
+                deployment_id = "latest"
+            except Exception as exc:
+                raise RuntimeError(str(first_error or exc))
 
         log_activity("system", f"بروزرسانی پنل به نسخه {remote_version} شروع شد", "ok")
         return {
@@ -7613,13 +7935,18 @@ async def api_update_deploy(token=Depends(require_auth)):
             "current_version": APP_VERSION,
             "latest_version": remote_version,
             "deployment_id": deployment_id,
-            "message": "بروزرسانی شروع شد؛ پنل پس از استقرار نسخه جدید دوباره در دسترس قرار می‌گیرد.",
+            "message": "بروزرسانی شروع شد؛ پنل پس از استقرار نسخه جدید دوباره در دسترس قرار می‌گیرد." + fork_note,
+            "fork_synced": bool(fork_note),
         }
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception("Panel update deployment failed")
-        raise HTTPException(502, detail=f"شروع بروزرسانی ناموفق بود: {exc}")
+        hint = ""
+        low = str(exc).lower()
+        if "not authorized" in low or "401" in low or "403" in low:
+            hint = " (توکن Railway نامعتبر است یا به این پروژه دسترسی ندارد؛ یک Project Token یا Account Token جدید بسازید)"
+        raise HTTPException(502, detail=f"شروع بروزرسانی ناموفق بود: {exc}{hint}")
 
 
 @app.get("/api/news")
@@ -13355,10 +13682,15 @@ let __updateInfo=null;
 let __updateCheckBusy=false;
 let __updatePollTimer=null;
 function updateText(fa,en){return lang==='fa'?fa:en}
-function toggleNotifications(force){const panel=document.getElementById('topNotifyPanel'),btn=document.getElementById('topNotifyBtn');if(!panel||!btn)return;const open=typeof force==='boolean'?force:panel.hidden;panel.hidden=!open;btn.setAttribute('aria-expanded',open?'true':'false')}
+function positionNotifyPanel(){const panel=document.getElementById('topNotifyPanel'),btn=document.getElementById('topNotifyBtn');if(!panel||!btn)return;const r=btn.getBoundingClientRect(),vw=window.innerWidth,w=Math.min(320,vw-24);panel.style.width=w+'px';panel.style.top=Math.round(r.bottom+8)+'px';let left=r.right-w;if(left<12)left=12;if(left+w>vw-12)left=vw-12-w;panel.style.left=Math.round(left)+'px';panel.style.right='auto'}
+function toggleNotifications(force){const panel=document.getElementById('topNotifyPanel'),btn=document.getElementById('topNotifyBtn');if(!panel||!btn)return;if(panel.parentElement!==document.body)document.body.appendChild(panel);const open=typeof force==='boolean'?force:panel.hidden;panel.hidden=!open;btn.setAttribute('aria-expanded',open?'true':'false');if(open)positionNotifyPanel()}
+document.addEventListener('click',e=>{const panel=document.getElementById('topNotifyPanel'),btn=document.getElementById('topNotifyBtn');if(!panel||panel.hidden)return;if(panel.contains(e.target)||(btn&&btn.contains(e.target)))return;toggleNotifications(false)});
+window.addEventListener('resize',()=>{const p=document.getElementById('topNotifyPanel');if(p&&!p.hidden)positionNotifyPanel()});
+window.addEventListener('scroll',()=>{const p=document.getElementById('topNotifyPanel');if(p&&!p.hidden)positionNotifyPanel()},{passive:true});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')toggleNotifications(false)});
 function renderNotifications(){const list=document.getElementById('notifyList'),badge=document.getElementById('notifyBadge');if(!list||!badge)return;if(!__updateInfo||!__updateInfo.update_available){badge.textContent='0';badge.classList.remove('show');list.innerHTML=`<div class="notify-empty">${updateText('اعلان جدیدی وجود ندارد.','No new notifications.')}</div>`;return;}badge.textContent='1';badge.classList.add('show');const r=__updateInfo;const changes=Array.isArray(r.changelog)&&r.changelog.length?`<div class="notify-item-text" style="margin-top:5px">${r.changelog.slice(0,4).map(x=>`• ${esc(String(x))}`).join('<br>')}</div>`:'';list.innerHTML=`<div class="notify-item"><div class="notify-item-title">🔄 ${esc(r.title||updateText('بروزرسانی جدید پنل','New panel update'))}</div><div class="notify-item-text">${esc(r.message||updateText('نسخه جدید پنل منتشر شده است.','A new panel version is available.'))}</div>${changes}<div class="notify-item-meta">${updateText('نسخه فعلی','Current version')}: ${esc(r.current_version||'—')} → ${esc(r.latest_version||'—')}</div><button type="button" class="notify-update-btn" onclick="toggleNotifications(false);panelUpdate()">${updateText('مشاهده و بروزرسانی','View update')}</button></div>`}
 async function checkPanelUpdateWithNotify(showToast=false){if(__updateCheckBusy)return __updateInfo;__updateCheckBusy=true;try{const r=await api('/api/update/check');if(r&&r.ok){const old=__updateInfo&&__updateInfo.latest_version;__updateInfo=r;setVersionLabels(r.current_version||'1.0.1',r.latest_version||r.current_version);renderNotifications();if(r.update_available&&old!==r.latest_version)showUpdatePrompt(r);if(r.update_available&&showToast&&old!==r.latest_version)toast(updateText(`نسخه جدید ${r.latest_version} آماده است`,`Version ${r.latest_version} is available`));}return r}catch(e){return null}finally{__updateCheckBusy=false}}
-function showUpdatePrompt(r){const modal=document.getElementById('updatePromptModal');if(!modal||!r||!r.update_available)return;const version=String(r.latest_version||'');if(!version)return;let seen='';try{seen=localStorage.getItem('onex_update_prompt_seen')||''}catch(e){}if(seen===version)return;const title=document.getElementById('updatePromptTitle'),text=document.getElementById('updatePromptText'),ver=document.getElementById('updatePromptVersion'),yes=document.getElementById('updatePromptConfirm'),later=document.getElementById('updatePromptLater');if(title)title.textContent=r.title||updateText('بروزرسانی جدید در دسترس است','New update is available');if(text)text.textContent=r.message||updateText('نسخه جدید پنل آماده است. آیا می‌خواهید پنل را بروزرسانی کنید؟','A new panel version is available. Would you like to update the panel?');if(ver)ver.textContent=updateText(`نسخه فعلی: ${r.current_version||'—'}  →  نسخه جدید: ${version}`,`Current: ${r.current_version||'—'}  →  New: ${version}`);modal.classList.add('open');modal.setAttribute('aria-hidden','false');const close=()=>{modal.classList.remove('open');modal.setAttribute('aria-hidden','true');try{localStorage.setItem('onex_update_prompt_seen',version)}catch(e){}};if(later)later.onclick=close;if(yes)yes.onclick=()=>{try{localStorage.setItem('onex_update_prompt_seen',version)}catch(e){}modal.classList.remove('open');modal.setAttribute('aria-hidden','true');panelUpdate();}}
+function showUpdatePrompt(r){const modal=document.getElementById('updatePromptModal');if(!modal||!r||!r.update_available)return;if(modal.parentElement!==document.body)document.body.appendChild(modal);const version=String(r.latest_version||'');if(!version)return;let seen='';let snooze=0;try{seen=localStorage.getItem('onex_update_prompt_seen')||'';snooze=Number(localStorage.getItem('onex_update_prompt_snooze')||0)}catch(e){}if(seen===version&&Date.now()<snooze)return;const title=document.getElementById('updatePromptTitle'),text=document.getElementById('updatePromptText'),ver=document.getElementById('updatePromptVersion'),yes=document.getElementById('updatePromptConfirm'),later=document.getElementById('updatePromptLater');if(title)title.textContent=r.title||updateText('بروزرسانی جدید در دسترس است','New update is available');if(text)text.textContent=r.message||updateText('نسخه جدید پنل آماده است. آیا می‌خواهید پنل را بروزرسانی کنید؟','A new panel version is available. Would you like to update the panel?');if(ver)ver.textContent=updateText(`نسخه فعلی: ${r.current_version||'—'}  →  نسخه جدید: ${version}`,`Current: ${r.current_version||'—'}  →  New: ${version}`);modal.classList.add('open');modal.setAttribute('aria-hidden','false');const close=()=>{modal.classList.remove('open');modal.setAttribute('aria-hidden','true');try{localStorage.setItem('onex_update_prompt_seen',version);localStorage.setItem('onex_update_prompt_snooze',String(Date.now()+6*3600*1000))}catch(e){}};if(later)later.onclick=close;if(yes)yes.onclick=()=>{try{localStorage.setItem('onex_update_prompt_seen',version)}catch(e){}modal.classList.remove('open');modal.setAttribute('aria-hidden','true');deployPanelUpdate();}}
 function startUpdateNotificationPolling(){if(__updatePollTimer)clearInterval(__updatePollTimer);checkPanelUpdateWithNotify(false);__updatePollTimer=setInterval(()=>checkPanelUpdateWithNotify(false),45000)}
 async function checkPanelUpdate(showToast=true){
   if(__updateCheckBusy)return __updateInfo;
@@ -13374,26 +13706,37 @@ async function checkPanelUpdate(showToast=true){
   finally{__updateCheckBusy=false}
 }
 async function panelUpdate(){
-  toast(updateText('شروع بروزرسانی خودکار...','Starting auto-update...'));
   const r=await checkPanelUpdate(false);
-  if(!r||!r.ok){toast(updateText('خطا در بررسی نسخه','Error checking version'));return}
-  if(!r.update_available){toast(updateText('پنل به‌روز است','Panel is up to date'));return}
-  deployPanelUpdate();
+  if(r&&r.ok&&!r.update_available){toast(updateText('پنل شما آخرین نسخه را دارد','Panel is up to date'));return}
+  if(r&&r.ok&&r.update_available){showUpdatePromptNow(r);return}
+  // Version check failed (network / GitHub limit): let the server try anyway.
+  if(confirm(updateText('بررسی نسخه انجام نشد. بروزرسانی به آخرین نسخه انجام شود؟','Version check failed. Update to the latest version anyway?')))deployPanelUpdate();
 }
+function showUpdatePromptNow(r){try{localStorage.removeItem('onex_update_prompt_seen');localStorage.removeItem('onex_update_prompt_snooze')}catch(e){}showUpdatePrompt(r)}
 
 async function deployPanelUpdate(){
   const btn=document.getElementById('panelDoUpdate');
   if(btn){btn.disabled=true;btn.textContent=updateText('در حال شروع بروزرسانی...','Starting update...')}
-  const r=await api('/api/update/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  toast(updateText('در حال شروع بروزرسانی...','Starting update...'));
+  let r=null,errText='';
+  try{
+    const res=await fetch('/api/update/deploy',{method:'POST',cache:'no-store',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:'{}'});
+    if(res.status===401){location.href='/login';return}
+    try{r=await res.json()}catch(e){r=null}
+    if(!res.ok){errText=(r&&(r.detail||r.error))||('HTTP '+res.status);r=null}
+  }catch(e){errText=updateText('ارتباط با سرور برقرار نشد','Could not reach the server')}
   if(r&&r.ok&&r.update_started){
     const b=document.getElementById('panelModalBody');
     if(b)b.innerHTML=`<div style="text-align:center;padding:18px"><div class="spin" style="margin:0 auto 14px"></div><p>${updateText('بروزرسانی شروع شد. پنل پس از استقرار نسخه جدید دوباره در دسترس قرار می‌گیرد.','The update has started. The panel will become available again after the new deployment is live.')}</p><p style="color:var(--t3);font-size:12px;margin-top:8px">${esc(r.latest_version||'')}</p></div>`;
-    setTimeout(()=>{location.reload()},12000);
+    toast(updateText('بروزرسانی شروع شد؛ چند دقیقه صبر کنید...','Update started, please wait a few minutes...'));
+    waitForNewVersion(r.latest_version);
     return;
   }
   if(btn){btn.disabled=false;btn.textContent=updateText('شروع بروزرسانی پنل','Update panel now')}
-  toast((r&&r.detail)||updateText('شروع بروزرسانی ناموفق بود','Could not start the update'));
+  if(r&&r.ok&&r.update_available===false){toast(r.message||updateText('پنل شما آخرین نسخه را دارد','Panel is up to date'));return}
+  toast(errText||(r&&r.message)||updateText('شروع بروزرسانی ناموفق بود','Could not start the update'));
 }
+function waitForNewVersion(target){let tries=0;const tick=async()=>{tries++;try{const res=await fetch('/api/update/check?force=1',{cache:'no-store',credentials:'same-origin'});if(res.ok){const d=await res.json();if(d&&d.current_version&&(!target||d.current_version===target)){location.reload();return}}}catch(e){}if(tries<60)setTimeout(tick,10000);else location.reload()};setTimeout(tick,20000)}
 
 let __tgUsers=[]; let __tgAudience='all';
 function switchTgTab(tab){document.querySelectorAll('#tgTabs button').forEach(b=>b.classList.toggle('on',b.dataset.tgTab===tab));document.querySelectorAll('.tg-tab-panel').forEach(p=>p.classList.toggle('on',p.dataset.tgPanel===tab));if(tab==='users')renderTelegramUsers(false);}
@@ -14855,10 +15198,17 @@ html.light .sidebar .nav-label{color:inherit!important}
   .main,.main.expanded{padding-top:10px!important}
 }
 </style>
-<style id="onex-notify-fix">/* Fix notification panel: was absolute inside flex .main, make it fixed. */
-.top-notify-panel{position:fixed!important;right:24px;top:70px;width:300px;max-width:calc(100vw - 48px)!important;z-index:2000!important}
+<style id="onex-notify-fix">/* 1.3.9: panel is moved to <body> by JS and positioned under the bell,
+   so parent stacking contexts (backdrop-filter/transform) can't hide it behind the dashboard. */
+.top-notify-panel{position:fixed!important;right:24px;top:70px;width:320px;max-width:calc(100vw - 24px)!important;max-height:min(70vh,520px);overflow:auto;z-index:2147483000!important}
 .top-notify-panel[hidden]{display:none!important}
 @media (max-width:700px){.top-notify-panel{right:12px;width:calc(100vw - 24px);max-width:none;top:66px}}
+.update-prompt-bg{z-index:2147483100!important;background:rgba(1,7,18,.72);backdrop-filter:blur(9px);-webkit-backdrop-filter:blur(9px)}
+.update-prompt-modal{width:min(440px,calc(100vw - 28px));padding:26px 24px 22px;border:1px solid rgba(88,180,255,.3);border-radius:22px;background:linear-gradient(160deg,rgba(18,24,42,.97),rgba(8,10,20,.98));box-shadow:0 28px 80px rgba(0,0,0,.55);text-align:center;color:var(--t1)}
+.update-prompt-icon{width:58px;height:58px;margin:0 auto 13px;border-radius:18px;display:grid;place-items:center;font-size:28px;font-weight:900;color:#fff;background:linear-gradient(135deg,var(--accent,#38d9ff),var(--accent2,#8b5cf6))}
+.update-prompt-title{font-size:18px;font-weight:900;margin-bottom:8px}.update-prompt-text{font-size:13px;line-height:1.9;color:var(--t2)}
+.update-prompt-version{margin:12px 0;padding:9px 12px;border-radius:11px;background:rgba(37,99,235,.08);border:1px solid rgba(96,165,250,.13);color:var(--t3);font-size:11px;direction:ltr}
+.update-prompt-actions{display:flex;gap:9px;margin-top:16px}.update-prompt-actions .btn{flex:1;height:42px}
 </style>
 </body>
 </html>
