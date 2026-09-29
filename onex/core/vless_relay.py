@@ -114,6 +114,18 @@ async def parse_trojan_header(chunk: bytes):
     return pw_hash, command, address, port, chunk[pos:]
 
 
+_HEX = frozenset(b"0123456789abcdefABCDEF")
+
+
+def looks_like_trojan(chunk: bytes) -> bool:
+    """Trojan starts with hex(SHA224(password)) + CRLF; VLESS starts with 0x00."""
+    return (
+        len(chunk) >= 58
+        and chunk[56:58] == b"\r\n"
+        and all(b in _HEX for b in chunk[:56])
+    )
+
+
 async def check_and_use(uid: str, n: int) -> bool:
     """Account bytes in one lock acquisition.
 
@@ -292,7 +304,12 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
             return
 
         reply_prefix = b"\x00\x00"
-        if protocol == "trojan-ws":
+        # /ws/{uuid} is shared by VLESS-WS and Trojan-WS. All-protocol and
+        # bundle subscriptions store only ONE primary protocol on the link,
+        # so trusting link["protocol"] made Trojan-WS get parsed as VLESS
+        # (garbage target -> no ping). Detect the real wire format instead.
+        if looks_like_trojan(first_chunk):
+            connections[conn_id]["transport"] = "trojan-ws"
             try:
                 pw_hash, command, address, port, payload = await parse_trojan_header(first_chunk)
             except Exception:
