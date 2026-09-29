@@ -1,11 +1,12 @@
 {
-  "version": "1.3.11",
-  "title": "ONEX 1.3.11",
-  "message": "پروتکل‌های Railway مثل قبل برگشتند و پروتکل‌های SideRail روی Xray کار می‌کنند.",
+  "version": "1.3.8",
+  "title": "ONEX 1.3.8 — High-clarity 3D ONEX PANEL branding",
+  "message": "افزایش اندازه، وضوح و درخشش لوگوی سه‌بعدی ONEX PANEL بدون تغییر در هسته پروتکل‌ها.",
   "changelog": [
-    "برگشت کامل رفتار پروتکل‌های Railway (VLESS WS، ONEX Xhttp، ONEX Gaming) به نسخه قبل",
-    "هسته SideRail از sing-box به Xray-core منتقل شد (رفع VMess WS و VLESS XHTTP)",
-    "حذف Dockerfile؛ دیپلوی مثل قبل با بیلد خودکار Railway"
+    "افزایش اندازه لوگوی ONEX PANEL در ناحیه برند پنل",
+    "افزایش وضوح و درخشش لوگو برای خوانایی بهتر",
+    "هماهنگ‌سازی اندازه لوگو در هدر، سایدبار و نوار موبایل",
+    "بدون تغییر در هسته XHTTP، WebSocket و منطق پروتکل‌ها"
   ],
-  "published_at": "2026-09-27"
+  "published_at": "2026-09-23"
 }

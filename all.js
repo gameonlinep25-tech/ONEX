@@ -1179,11 +1179,10 @@ async function restoreBot(){
    LIGHT STATIC 3D PROTOCOL PICKER
    ============================================================ */
 const PROTOCOL_PICKER_GROUPS=[
-  {title:'Railway',ids:['vless-ws','xhttp-packet-up','xhttp-stream-up']},
-  {title:'SideRail',ids:['vless-ws','siderail-vless-xhttp','vmess-ws','trojan-ws','vless-httpupgrade']}
+  {title:'',ids:['vless-ws','xhttp-packet-up','xhttp-stream-up','xhttp-stream-one']}
 ];
-const PROTOCOL_PICKER_NAMES={"vless-ws":"SideRail VLESS WS","siderail-vless-xhttp":"SideRail VLESS XHTTP","vmess-ws":"SideRail VMess WS","trojan-ws":"SideRail Trojan WS","vless-httpupgrade":"SideRail VLESS HTTPUpgrade","xhttp-packet-up":"ONEX Xhttp","xhttp-stream-up":"ONEX Gaming","xhttp-stream-one":"ONEX Stream","trojan":"Trojan","shadowsocks":"Shadowsocks","socks5":"SOCKS5","http":"HTTP Proxy","hysteria2":"Hysteria2","vless-grpc-reality":"VLESS gRPC Reality"};
-const PROTOCOL_PICKER_DESCS={"vless-ws":"VLESS + WebSocket","siderail-vless-xhttp":"VLESS + XHTTP","vmess-ws":"VMess + WebSocket","trojan-ws":"Trojan + WebSocket","vless-httpupgrade":"VLESS + HTTPUpgrade","xhttp-packet-up":"VLESS + XHTTP","xhttp-stream-up":"VLESS + XHTTP","xhttp-stream-one":"VLESS + XHTTP stream-one","trojan":"Trojan","shadowsocks":"Shadowsocks","socks5":"SOCKS5","http":"HTTP Proxy","hysteria2":"Hysteria2","vless-grpc-reality":"VLESS + gRPC + Reality"};
+const PROTOCOL_PICKER_NAMES={"vless-ws":"ONEX WB","xhttp-packet-up":"ONEX Xhttp","xhttp-stream-up":"ONEX Gaming","xhttp-stream-one":"ONEX Stream","trojan":"Trojan","shadowsocks":"Shadowsocks","socks5":"SOCKS5","http":"HTTP Proxy","hysteria2":"Hysteria2","vless-grpc-reality":"VLESS gRPC Reality"};
+const PROTOCOL_PICKER_DESCS={"vless-ws":"VLESS + WebSocket","xhttp-packet-up":"VLESS + XHTTP","xhttp-stream-up":"VLESS + XHTTP","xhttp-stream-one":"VLESS + XHTTP","trojan":"Trojan","shadowsocks":"Shadowsocks","socks5":"SOCKS5","http":"HTTP Proxy","hysteria2":"Hysteria2","vless-grpc-reality":"VLESS + gRPC + Reality"};
 const PROTOCOL_3D_ICONS={
   "vless-ws":{c1:"#24a9ff",c2:"#1264ff",c3:"#6d3cff",mark:"V",glow:"#168cff"},
   "xhttp-packet-up":{c1:"#35c8ff",c2:"#0877d8",c3:"#3155ff",mark:"XP",glow:"#21b8ff"},
