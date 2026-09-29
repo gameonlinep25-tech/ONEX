@@ -23,7 +23,6 @@ from main import (
     is_ip_allowed,
     log_activity,
     now_ir,
-    is_destination_blocked,
 )
 from onex.core.traffic_limiter import throttle
 
@@ -315,10 +314,6 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         stats["total_requests"] += 1
         connections[conn_id]["bytes"] += len(first_chunk)
         logger.info(f"➡️  [{conn_id}] → {address}:{port}")
-        if is_destination_blocked(address, link):
-            logger.info(f"🚫 blocked destination [{conn_id}] → {address}")
-            await ws.close(code=1008, reason="blocked destination")
-            return
 
         reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
         _tune_socket(writer)

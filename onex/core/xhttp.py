@@ -22,7 +22,6 @@ from main import (
     is_link_allowed,
     is_ip_allowed,
     save_state,
-    is_destination_blocked,
 )
 from onex.core.vless_relay import parse_vless_header, check_and_use
 from onex.core.traffic_limiter import throttle
@@ -192,8 +191,6 @@ async def _open_tcp_from_header(first_chunk: bytes):
     # confusing client-side latency failures.
     if command != 1:
         raise ValueError(f"unsupported VLESS command: {command}")
-    if is_destination_blocked(address):
-        raise HTTPException(status_code=403, detail="blocked destination")
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(address, port), timeout=TCP_CONNECT_TIMEOUT
     )
