@@ -12819,12 +12819,13 @@ document.getElementById('sbToggle').onclick=()=>{
   document.getElementById('sbToggle').setAttribute('aria-label',sb.classList.contains('collapsed')?'باز کردن منو':'جمع کردن منو');
   localStorage.setItem('sb_c',sb.classList.contains('collapsed')?'1':'0');
 };
-if(localStorage.getItem('sb_c')==='1'){sb.classList.add('collapsed');main.classList.add('expanded')}
+function syncSidebarCollapse(){const mob=window.matchMedia('(max-width:640px)').matches;const c=!mob&&localStorage.getItem('sb_c')==='1';sb.classList.toggle('collapsed',c);main.classList.toggle('expanded',c)}
+syncSidebarCollapse();try{const __sbMq=window.matchMedia('(max-width:640px)');(__sbMq.addEventListener?__sbMq.addEventListener('change',syncSidebarCollapse):__sbMq.addListener(syncSidebarCollapse))}catch(e){}
 document.addEventListener('keydown',e=>{
   if(e.target.closest('input,textarea,select,[contenteditable="true"]'))return;
   if(e.key==='['||e.code==='BracketLeft'){
     e.preventDefault();
-    if(window.matchMedia('(max-width:900px)').matches){
+    if(window.matchMedia('(max-width:640px)').matches){
       if(sb.classList.contains('mobile-open')) closeMobileNav(); else openMobileNav();
     }else document.getElementById('sbToggle').click();
   }
@@ -14832,6 +14833,43 @@ html.light .sidebar .nav-label{color:inherit!important}
   try{if(document.getElementById('cfgCards')&&Array.isArray(__allLinks))renderConfigCards(getFilteredConfigs())}catch(err){}
 })();
 </script>
+<style id="onex-layout-fix">
+/* ============================================================
+   ONEX LAYOUT FIX (desktop + mobile)
+   1) Desktop: the neural sidebar block forced position:relative,
+      so the sidebar sat in the flex row AND .main kept its
+      margin-right => content pushed ~2x sidebar width and the
+      sidebar scrolled away with the page. Restore fixed sidebar.
+   2) Collapse toggle was clipped by overflow:hidden.
+   3) Modals living inside .main were trapped under the sidebar
+      and positioned relative to .main (backdrop-filter).
+   4) Phone: doubled top offset (body padding + main padding).
+   ============================================================ */
+@media (min-width:641px){
+  .sidebar{position:fixed!important;top:0;right:0;bottom:0;left:auto;height:100vh;height:100dvh;
+    overflow:visible;
+    clip-path:polygon(0 0,100% 0,100% 100%,0 100%,0 calc(50% + 34px),-34px calc(50% + 34px),-34px calc(50% - 34px),0 calc(50% - 34px))}
+  .sidebar .nav{min-height:0;overflow-y:auto;overflow-x:hidden}
+  .sidebar .sb-foot{flex:0 0 auto}
+  .main{margin-right:var(--sb)}
+  .main.expanded{margin-right:var(--sb-c)}
+  .sidebar.collapsed .nav-item{padding:9px 0!important;justify-content:center}
+  .onex-topbar{min-width:0}
+  .onex-topbar .top-server{min-width:0;overflow:hidden}
+  .onex-topbar .top-server small{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+}
+/* Nav pills: full width of the nav column (was 100%-20px with 0 margin => lopsided). */
+.sidebar .nav-item{width:100%!important}
+/* Modals inside .main: lift .main above sidebar/top bar while one is open. */
+.main:has(.modal-bg.open),.main:has(.logs-modal-bg.open){z-index:1400!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important}
+@media (max-width:640px){
+  .main,.main.expanded{padding-top:12px!important}
+}
+@media (max-width:480px){
+  .sidebar{top:56px!important;height:calc(100dvh - 56px)!important}
+  .main,.main.expanded{padding-top:10px!important}
+}
+</style>
 </body>
 </html>
 """
