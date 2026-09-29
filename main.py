@@ -13374,28 +13374,13 @@ async function checkPanelUpdate(showToast=true){
   finally{__updateCheckBusy=false}
 }
 async function panelUpdate(){
-  const m=document.getElementById('panelModal');
-  const t=document.getElementById('panelModalTitle');
-  const b=document.getElementById('panelModalBody');
-  t.textContent=updateText('در حال بررسی نسخه جدید...','Checking for updates...');
-  b.innerHTML='<div style="text-align:center;padding:20px"><div class="spin"></div></div>';
-  m.classList.add('open');
+  toast(updateText('شروع بروزرسانی خودکار...','Starting auto-update...'));
   const r=await checkPanelUpdate(false);
-  if(!r||!r.ok){
-    t.textContent=updateText('بررسی بروزرسانی','Update check');
-    b.innerHTML=`<p>${updateText('در حال حاضر امکان بررسی نسخه جدید وجود ندارد.','The update server could not be reached right now.')}</p>`;
-    return;
-  }
-  if(!r.update_available){
-    t.textContent=updateText('پنل به‌روز است','Panel is up to date');
-    b.innerHTML=`<div style="text-align:center;padding:18px"><div style="font-size:34px;margin-bottom:8px">✓</div><p style="margin-bottom:6px">${updateText('نسخه فعلی پنل: ','Current panel version: ')}<strong>${esc(r.current_version)}</strong></p><p style="color:var(--t3)">${updateText('نسخه جدیدی منتشر نشده است.','No newer version has been released.')}</p></div>`;
-    return;
-  }
-  t.textContent=updateText('بروزرسانی پنل','Panel update');
-  const changes=Array.isArray(r.changelog)&&r.changelog.length?`<div style="margin:12px 0;text-align:right"><strong>${updateText('تغییرات نسخه جدید:','What’s new:')}</strong><ul style="margin:8px 0;padding-right:20px">${r.changelog.slice(0,8).map(x=>`<li>${esc(String(x))}</li>`).join('')}</ul></div>`:'';
-  b.innerHTML=`<div style="padding:4px 0"><p style="margin-bottom:8px"><strong>${esc(r.title||('ONEX '+r.latest_version))}</strong></p><p style="margin-bottom:8px">${esc(r.message||updateText('نسخه جدید پنل آماده است.','A new panel version is available.'))}</p>${changes}<p style="color:var(--t3);font-size:12px">${updateText('نسخه فعلی: ','Current: ')}${esc(r.current_version)} &nbsp;→&nbsp; ${updateText('نسخه جدید: ','New: ')}${esc(r.latest_version)}</p><button type="button" class="btn btn-primary" id="panelDoUpdate" style="width:100%;margin-top:14px">${updateText('شروع بروزرسانی پنل','Update panel now')}</button></div>`;
-  document.getElementById('panelDoUpdate').onclick=deployPanelUpdate;
+  if(!r||!r.ok){toast(updateText('خطا در بررسی نسخه','Error checking version'));return}
+  if(!r.update_available){toast(updateText('پنل به‌روز است','Panel is up to date'));return}
+  deployPanelUpdate();
 }
+
 async function deployPanelUpdate(){
   const btn=document.getElementById('panelDoUpdate');
   if(btn){btn.disabled=true;btn.textContent=updateText('در حال شروع بروزرسانی...','Starting update...')}
@@ -14869,6 +14854,11 @@ html.light .sidebar .nav-label{color:inherit!important}
   .sidebar{top:56px!important;height:calc(100dvh - 56px)!important}
   .main,.main.expanded{padding-top:10px!important}
 }
+</style>
+<style id="onex-notify-fix">/* Fix notification panel: was absolute inside flex .main, make it fixed. */
+.top-notify-panel{position:fixed!important;right:24px;top:70px;width:300px;max-width:calc(100vw - 48px)!important;z-index:2000!important}
+.top-notify-panel[hidden]{display:none!important}
+@media (max-width:700px){.top-notify-panel{right:12px;width:calc(100vw - 24px);max-width:none;top:66px}}
 </style>
 </body>
 </html>
